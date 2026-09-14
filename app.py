@@ -10,7 +10,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Estilos CSS personalizados para diseño de tienda y Bento Grid
+# Estilos CSS personalizados
 st.markdown("""
 <style>
     .store-badge {
@@ -142,7 +142,7 @@ else:
                             st.markdown(get_store_badge(retailer), unsafe_allow_html=True)
                             st.caption(f"Marca: **{brand}**")
                             
-                            # Título (cortado para mantener grid parejo)
+                            # Título
                             disp_title = title if len(title) <= 55 else f"{title[:52]}..."
                             st.markdown(f"**{disp_title}**")
 
