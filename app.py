@@ -10,7 +10,7 @@ st.set_page_config(
     layout="wide"
 )
 
-# Estilo visual moderno
+# Estilo visual
 st.markdown("""
 <style>
     .metric-card {
@@ -19,14 +19,6 @@ st.markdown("""
         border-radius: 12px;
         border: 1px solid #2d3748;
         margin-bottom: 12px;
-    }
-    .best-price {
-        color: #48bb78;
-        font-weight: bold;
-    }
-    .inflated-price {
-        color: #f56565;
-        font-weight: bold;
     }
 </style>
 """, unsafe_allow_html=True)
@@ -58,7 +50,7 @@ with col_search:
 with col_cat:
     selected_retailer = st.selectbox("Filtrar por tienda:", ["Todas", "siman", "lacuracao", "walmart", "omnisport", "prado"])
 
-# Métricas generales en cards Bento
+# Métricas generales
 col_m1, col_m2, col_m3 = st.columns(3)
 total_prods = products_col.count_documents({})
 col_m1.metric("📦 Productos Monitoreados", total_prods)
@@ -93,12 +85,11 @@ else:
             regular_price = history[-1].get("regular_price", 0.0)
             prices = [h.get("offer_price", 0.0) for h in history if h.get("offer_price", 0.0) > 0]
             min_price = min(prices) if prices else current_price
-            max_price = max(prices) if prices else current_price
         else:
-            current_price = regular_price = min_price = max_price = 0.0
+            current_price = regular_price = min_price = 0.0
 
         with st.expander(f"**[{retailer}]** {title} — **${current_price:.2f}**", expanded=False):
-            col_info, col_chart = st.columns()
+            col_info, col_chart = st.columns(2)
 
             with col_info:
                 st.markdown(f"**Marca:** {brand}")
