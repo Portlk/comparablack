@@ -72,8 +72,8 @@ history_col = db["price_history"]
 st.title("🛍️ ComparaBlack SV")
 st.caption("Comparador y auditor de precios contra ofertas engañosas en Black Friday (El Salvador)")
 
-# Barra Superior: Búsqueda, Filtro y Selector de Vista
-col_search, col_store, col_view = st.columns()
+# Barra Superior: Búsqueda, Filtro y Selector de Vista (3 COLUMNAS)
+col_search, col_store, col_view = st.columns(3)
 with col_search:
     search_query = st.text_input("🔍 Buscar producto o modelo (ej. Samsung 55, Inverter, Mabe, LG):", "")
 with col_store:
@@ -81,7 +81,7 @@ with col_store:
 with col_view:
     view_mode = st.radio("Vista:", ["🖼️ Mosaico", "📋 Lista"], horizontal=True)
 
-# Métricas Bento
+# Métricas Bento (3 COLUMNAS)
 total_prods = products_col.count_documents({})
 m1, m2, m3 = st.columns(3)
 m1.metric("📦 Productos Rastreados", total_prods)
@@ -185,7 +185,8 @@ else:
             reg_price = history[-1].get("regular_price", 0.0) if history else 0.0
 
             with st.container(border=True):
-                c_img, c_desc, c_prc, c_act = st.columns()
+                # 4 COLUMNAS EN VISTA DE LISTA
+                c_img, c_desc, c_prc, c_act = st.columns(4)
                 with c_img:
                     st.image(img_url, width=90)
                 with c_desc:
