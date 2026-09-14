@@ -294,6 +294,21 @@ st.markdown(
 
 
 # =========================================================
+# SAFE HTML RENDERER
+# =========================================================
+def render_html(markup: str):
+    """Render UI HTML without letting Markdown treat indentation as code."""
+    if hasattr(st, "html"):
+        st.html(markup)
+        return
+
+    # Fallback for older Streamlit versions. Compacting the markup prevents
+    # indented HTML lines from becoming Markdown code blocks.
+    compact = " ".join(line.strip() for line in markup.splitlines() if line.strip())
+    st.markdown(compact, unsafe_allow_html=True)
+
+
+# =========================================================
 # DATABASE
 # =========================================================
 def get_mongo_uri():
@@ -681,29 +696,21 @@ def monitor_html(item):
             '</div>'
         )
 
-    return f"""
-        <div class="monitor">
-            <div class="monitor-labels">
-                <span>Mín {money(lo)}</span>
-                <span>Actual {money(current)}</span>
-                <span>Máx {money(hi)}</span>
-            </div>
-
-            <div class="monitor-track">
-                <div
-                    class="monitor-fill"
-                    style="width:100%">
-                </div>
-            </div>
-
-            <div class="monitor-marker-wrap">
-                <span
-                    class="monitor-marker"
-                    style="left:{position}%">
-                </span>
-            </div>
-        </div>
-    """
+    return (
+        f'<div class="monitor">'
+        f'<div class="monitor-labels">'
+        f'<span>Mín {money(lo)}</span>'
+        f'<span>Actual {money(current)}</span>'
+        f'<span>Máx {money(hi)}</span>'
+        f'</div>'
+        f'<div class="monitor-track">'
+        f'<div class="monitor-fill" style="width:100%"></div>'
+        f'</div>'
+        f'<div class="monitor-marker-wrap">'
+        f'<span class="monitor-marker" style="left:{position}%"></span>'
+        f'</div>'
+        f'</div>'
+    )
 
 
 def render_product_card(item, key_prefix="card"):
@@ -735,25 +742,15 @@ def render_product_card(item, key_prefix="card"):
                 use_container_width=True,
             )
         else:
-            st.markdown(
+            render_html(
                 """
-                <div style="
-                    height:150px;
-                    display:grid;
-                    place-items:center;
-                    background:#f3f4f6;
-                    border-radius:12px;
-                    color:#9ca3af;">
+                <div style="height:150px;display:grid;place-items:center;background:#f3f4f6;border-radius:12px;color:#9ca3af;">
                     Sin imagen
                 </div>
-                """,
-                unsafe_allow_html=True,
+                """
             )
 
-        st.markdown(
-            store_badge(prod.get("retailer")),
-            unsafe_allow_html=True,
-        )
+        render_html(store_badge(prod.get("retailer")))
 
         short_title = (
             title[:78] + "…"
@@ -769,20 +766,11 @@ def render_product_card(item, key_prefix="card"):
 
         st.caption(detail)
 
-        st.markdown(
-            price_html(item),
-            unsafe_allow_html=True,
-        )
+        render_html(price_html(item))
 
-        st.markdown(
-            status_badge(item),
-            unsafe_allow_html=True,
-        )
+        render_html(status_badge(item))
 
-        st.markdown(
-            monitor_html(item),
-            unsafe_allow_html=True,
-        )
+        render_html(monitor_html(item))
 
         st.caption(
             f"{item['captures']} capturas · "
@@ -859,23 +847,14 @@ def history_dataframe(item):
 # =========================================================
 # HEADER
 # =========================================================
-st.markdown(
+render_html(
     """
     <div class="hero">
-        <div class="eyebrow">
-            ● PRICE INTELLIGENCE · EL SALVADOR
-        </div>
-
+        <div class="eyebrow">● PRICE INTELLIGENCE · EL SALVADOR</div>
         <h1>ComparaBlack SV</h1>
-
-        <p>
-            Monitorea precios, valida descuentos y compara
-            comercios antes de comprar. Menos ruido de
-            “ofertas”; más evidencia histórica.
-        </p>
+        <p>Monitorea precios, valida descuentos y compara comercios antes de comprar. Menos ruido de “ofertas”; más evidencia histórica.</p>
     </div>
-    """,
-    unsafe_allow_html=True,
+    """
 )
 
 
@@ -1028,24 +1007,9 @@ with tab_overview:
         )
 
     else:
-        st.markdown(
-            """
-            <div class="section-title">
-                Oportunidades destacadas
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_html('<div class="section-title">Oportunidades destacadas</div>')
 
-        st.markdown(
-            """
-            <div class="section-copy">
-                Prioriza precio actual, descuento
-                y cercanía al mínimo histórico.
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_html('<div class="section-copy">Prioriza precio actual, descuento y cercanía al mínimo histórico.</div>')
 
         render_product_grid(
             items,
@@ -1061,14 +1025,7 @@ with tab_overview:
         )
 
         with left:
-            st.markdown(
-                """
-                <div class="section-title">
-                    Distribución de precios por comercio
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            render_html('<div class="section-title">Distribución de precios por comercio</div>')
 
             chart_rows = []
 
@@ -1126,14 +1083,7 @@ with tab_overview:
                 )
 
         with right:
-            st.markdown(
-                """
-                <div class="section-title">
-                    Cobertura del catálogo
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
+            render_html('<div class="section-title">Cobertura del catálogo</div>')
 
             coverage = pd.DataFrame(
                 [
@@ -1197,25 +1147,9 @@ with tab_overview:
 # TAB: OFFERS
 # =========================================================
 with tab_offers:
-    st.markdown(
-        """
-        <div class="section-title">
-            Ofertas verificables
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-title">Ofertas verificables</div>')
 
-    st.markdown(
-        """
-        <div class="section-copy">
-            Productos con rebaja visible,
-            ordenados por oportunidad real
-            y contexto histórico.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-copy">Productos con rebaja visible, ordenados por oportunidad real y contexto histórico.</div>')
 
     o1, o2, o3 = st.columns(3)
 
@@ -1281,24 +1215,9 @@ with tab_offers:
 # TAB: COMPARE
 # =========================================================
 with tab_compare:
-    st.markdown(
-        """
-        <div class="section-title">
-            Comparador entre almacenes
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-title">Comparador entre almacenes</div>')
 
-    st.markdown(
-        """
-        <div class="section-copy">
-            Busca un modelo o término específico
-            y revisa coincidencias entre comercios.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-copy">Busca un modelo o término específico y revisa coincidencias entre comercios.</div>')
 
     compare_query = st.text_input(
         "Producto a comparar",
@@ -1541,24 +1460,9 @@ with tab_compare:
 # TAB: MONITOR
 # =========================================================
 with tab_monitor:
-    st.markdown(
-        """
-        <div class="section-title">
-            Monitoreo de precio
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-title">Monitoreo de precio</div>')
 
-    st.markdown(
-        """
-        <div class="section-copy">
-            Selecciona un producto y revisa
-            su trayectoria, rango y nivel actual.
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    render_html('<div class="section-copy">Selecciona un producto y revisa su trayectoria, rango y nivel actual.</div>')
 
     monitored = [
         item
@@ -1606,10 +1510,7 @@ with tab_monitor:
             item["captures"],
         )
 
-        st.markdown(
-            monitor_html(item),
-            unsafe_allow_html=True,
-        )
+        render_html(monitor_html(item))
 
         df_h = history_dataframe(item)
 
