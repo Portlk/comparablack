@@ -4,6 +4,7 @@ import sys
 import time
 from collections import defaultdict, deque
 from datetime import datetime, timezone
+from uuid import uuid4
 from urllib.parse import urljoin, urlparse, urlunparse, parse_qsl, urlencode
 
 import httpx
@@ -34,6 +35,17 @@ HTML_MAX_PAGES = int(os.getenv("HTML_MAX_PAGES", "30"))
 HTTP_TIMEOUT = float(os.getenv("HTTP_TIMEOUT", "30"))
 REQUEST_RETRIES = int(os.getenv("REQUEST_RETRIES", "3"))
 REQUEST_DELAY = float(os.getenv("REQUEST_DELAY", "0.15"))
+SITE_MAX_RETRY_EVENTS = int(os.getenv("SITE_MAX_RETRY_EVENTS", "5"))
+
+# Cadencia por comercio. La Curacao es bastante más sensible
+# a tráfico automatizado, así que la tratamos con más calma.
+RETAILER_DELAYS = {
+    "lacuracao": float(os.getenv("LACURACAO_REQUEST_DELAY", "2.0")),
+    "prado": float(os.getenv("PRADO_REQUEST_DELAY", "0.65")),
+    "omnisport": float(os.getenv("OMNISPORT_REQUEST_DELAY", "0.65")),
+    "siman": float(os.getenv("SIMAN_REQUEST_DELAY", str(REQUEST_DELAY))),
+    "walmart": float(os.getenv("WALMART_REQUEST_DELAY", str(REQUEST_DELAY))),
+}
 
 HEADERS = {
     "User-Agent": (
@@ -53,6 +65,269 @@ client = MongoClient(MONGO_URI)
 db = client[DB_NAME]
 products_col = db["products"]
 history_col = db["price_history"]
+tracker_logs_col = db["tracker_logs"]
+tracker_runs_col = db["tracker_runs"]
+
+RUN_ID = (
+    datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    + "-"
+    + uuid4().hex[:8]
+)
+
+SITE_STATE = {}
+
+
+
+# =========================================================
+# TRACKER LOGGING + CIRCUIT BREAKER
+# =========================================================
+def utc_now():
+    return datetime.now(timezone.utc)
+
+
+def get_site_state(retailer):
+    retailer = str(retailer or "unknown").lower()
+
+    if retailer not in SITE_STATE:
+        SITE_STATE[retailer] = {
+            "retry_events": 0,
+            "consecutive_retry_events": 0,
+            "failed_requests": 0,
+            "blocked": False,
+            "reason": "",
+            "products": 0,
+        }
+
+    return SITE_STATE[retailer]
+
+
+def reset_site_state(retailer):
+    SITE_STATE[str(retailer).lower()] = {
+        "retry_events": 0,
+        "consecutive_retry_events": 0,
+        "failed_requests": 0,
+        "blocked": False,
+        "reason": "",
+        "products": 0,
+    }
+
+
+def log_event(
+    retailer,
+    level,
+    event,
+    message,
+    *,
+    status_code=None,
+    context="",
+    url="",
+    retry_count=None,
+    extra=None,
+):
+    retailer = str(retailer or "system").lower()
+
+    doc = {
+        "run_id": RUN_ID,
+        "timestamp": utc_now(),
+        "retailer": retailer,
+        "level": str(level).upper(),
+        "event": str(event),
+        "message": str(message),
+        "status_code": status_code,
+        "context": str(context or ""),
+        "url": str(url or ""),
+        "retry_count": retry_count,
+        "extra": extra or {},
+    }
+
+    status_text = (
+        f" HTTP={status_code}"
+        if status_code is not None
+        else ""
+    )
+
+    print(
+        f"[{doc['level']}] [{retailer}] "
+        f"{event}{status_text}: {message}"
+    )
+
+    try:
+        tracker_logs_col.insert_one(doc)
+    except Exception as exc:
+        # Si Mongo está caído no se puede registrar el error dentro del mismo Mongo.
+        print(f"[LOG] No se pudo persistir tracker_logs: {exc}")
+
+
+def update_run_store(
+    retailer,
+    *,
+    status,
+    products=None,
+    reason="",
+):
+    state = get_site_state(retailer)
+
+    payload = {
+        f"stores.{retailer}.status": status,
+        f"stores.{retailer}.retry_events": state["retry_events"],
+        f"stores.{retailer}.failed_requests": state["failed_requests"],
+        f"stores.{retailer}.reason": reason or state["reason"],
+        f"stores.{retailer}.updated_at": utc_now(),
+    }
+
+    if products is not None:
+        payload[f"stores.{retailer}.products"] = int(products)
+
+    try:
+        tracker_runs_col.update_one(
+            {"run_id": RUN_ID},
+            {"$set": payload},
+            upsert=True,
+        )
+    except Exception as exc:
+        print(
+            f"[RUN] No se pudo actualizar estado de {retailer}: {exc}"
+        )
+
+
+def mark_site_success(retailer):
+    state = get_site_state(retailer)
+    state["consecutive_retry_events"] = 0
+
+
+def is_site_blocked(retailer):
+    return get_site_state(retailer)["blocked"]
+
+
+def block_site(
+    retailer,
+    reason,
+    *,
+    context="",
+    status_code=None,
+):
+    state = get_site_state(retailer)
+
+    if state["blocked"]:
+        return
+
+    state["blocked"] = True
+    state["reason"] = str(reason)
+
+    log_event(
+        retailer,
+        "ERROR",
+        "SITE_SKIPPED",
+        (
+            f"Se omite {retailer} durante el resto de esta ejecución. "
+            f"Motivo: {reason}"
+        ),
+        status_code=status_code,
+        context=context,
+        retry_count=state["retry_events"],
+    )
+
+    update_run_store(
+        retailer,
+        status="skipped",
+        products=state.get("products", 0),
+        reason=reason,
+    )
+
+
+def register_retry(
+    retailer,
+    *,
+    status_code=None,
+    context="",
+    url="",
+    message="",
+):
+    state = get_site_state(retailer)
+
+    state["retry_events"] += 1
+    state["consecutive_retry_events"] += 1
+
+    streak = state["consecutive_retry_events"]
+
+    log_event(
+        retailer,
+        "WARNING",
+        "HTTP_RETRY",
+        (
+            message
+            or (
+                f"Reintento consecutivo "
+                f"{streak}/{SITE_MAX_RETRY_EVENTS}."
+            )
+        ),
+        status_code=status_code,
+        context=context,
+        url=url,
+        retry_count=streak,
+    )
+
+    if streak >= SITE_MAX_RETRY_EVENTS:
+        block_site(
+            retailer,
+            (
+                f"{streak} reintentos consecutivos. "
+                "Circuit breaker activado para continuar "
+                "con los demás comercios."
+            ),
+            context=context,
+            status_code=status_code,
+        )
+        return False
+
+    return True
+
+
+def register_request_failure(
+    retailer,
+    *,
+    context="",
+    message="Request agotó sus reintentos.",
+):
+    state = get_site_state(retailer)
+    state["failed_requests"] += 1
+
+    log_event(
+        retailer,
+        "ERROR",
+        "REQUEST_FAILED",
+        message,
+        context=context,
+        retry_count=state["retry_events"],
+    )
+
+
+def retailer_delay(retailer):
+    return RETAILER_DELAYS.get(
+        str(retailer).lower(),
+        REQUEST_DELAY,
+    )
+
+
+def polite_sleep(retailer):
+    delay = retailer_delay(retailer)
+    if delay > 0:
+        time.sleep(delay)
+
+
+def retry_after_seconds(response, attempt):
+    value = response.headers.get("Retry-After")
+
+    if value:
+        try:
+            return max(
+                0.5,
+                min(float(value), 20.0),
+            )
+        except (TypeError, ValueError):
+            pass
+
+    return min(12.0, 2.0 * attempt)
 
 
 # =========================================================
@@ -60,8 +335,9 @@ history_col = db["price_history"]
 # =========================================================
 def ensure_indexes():
     """
-    Si ya existen duplicados viejos, Mongo puede rechazar el índice unique.
-    No detenemos el tracker por eso; imprimimos el diagnóstico.
+    Crea índices útiles para productos, históricos y observabilidad.
+    Si existen duplicados viejos, un índice unique puede fallar;
+    no detenemos el tracker por eso.
     """
     indexes = [
         (
@@ -104,6 +380,27 @@ def ensure_indexes():
                 "sparse": True,
             },
         ),
+        (
+            tracker_logs_col,
+            [("timestamp", -1), ("retailer", 1)],
+            {
+                "name": "tracker_logs_time_store",
+            },
+        ),
+        (
+            tracker_logs_col,
+            [("run_id", 1), ("level", 1)],
+            {
+                "name": "tracker_logs_run_level",
+            },
+        ),
+        (
+            tracker_runs_col,
+            [("started_at", -1)],
+            {
+                "name": "tracker_runs_started",
+            },
+        ),
     ]
 
     for collection, keys, kwargs in indexes:
@@ -111,9 +408,9 @@ def ensure_indexes():
             collection.create_index(keys, **kwargs)
         except Exception as exc:
             print(
-                f"[INDEX] No se pudo crear {kwargs.get('name')}: {exc}"
+                f"[INDEX] No se pudo crear "
+                f"{kwargs.get('name')}: {exc}"
             )
-
 
 # =========================================================
 # NORMALIZATION / MATCH METADATA
@@ -255,13 +552,22 @@ def request(
     method,
     url,
     *,
+    retailer="system",
     params=None,
     expect_json=False,
     label="request",
 ):
+    retailer = str(retailer or "system").lower()
+
+    if is_site_blocked(retailer):
+        return None
+
     last_error = None
 
     for attempt in range(1, REQUEST_RETRIES + 1):
+        if is_site_blocked(retailer):
+            return None
+
         try:
             response = http.request(
                 method,
@@ -269,51 +575,157 @@ def request(
                 params=params,
             )
 
-            if response.status_code == 429:
-                wait = min(8, 1.5 * attempt)
-                print(
-                    f"[HTTP] 429 en {label}. "
-                    f"Reintento en {wait:.1f}s..."
+            status = response.status_code
+
+            if status == 429:
+                wait = retry_after_seconds(
+                    response,
+                    attempt,
                 )
+
+                if not register_retry(
+                    retailer,
+                    status_code=429,
+                    context=label,
+                    url=str(response.url),
+                    message=(
+                        f"Rate limit 429 en {label}. "
+                        f"Intento {attempt}/{REQUEST_RETRIES}; "
+                        f"espera {wait:.1f}s."
+                    ),
+                ):
+                    return None
+
                 time.sleep(wait)
                 continue
 
-            if 500 <= response.status_code < 600:
-                wait = min(8, 1.5 * attempt)
-                print(
-                    f"[HTTP] {response.status_code} en {label}. "
-                    f"Reintento en {wait:.1f}s..."
+            if status in (401, 403):
+                block_site(
+                    retailer,
+                    (
+                        f"HTTP {status}: el comercio rechazó "
+                        "el acceso del tracker."
+                    ),
+                    context=label,
+                    status_code=status,
                 )
+                return None
+
+            if 500 <= status < 600:
+                wait = retry_after_seconds(
+                    response,
+                    attempt,
+                )
+
+                if not register_retry(
+                    retailer,
+                    status_code=status,
+                    context=label,
+                    url=str(response.url),
+                    message=(
+                        f"HTTP {status} en {label}. "
+                        f"Intento {attempt}/{REQUEST_RETRIES}; "
+                        f"espera {wait:.1f}s."
+                    ),
+                ):
+                    return None
+
                 time.sleep(wait)
                 continue
 
-            if response.status_code != 200:
+            if status != 200:
+                log_event(
+                    retailer,
+                    "WARNING",
+                    "HTTP_NON_200",
+                    f"HTTP {status} en {label}.",
+                    status_code=status,
+                    context=label,
+                    url=str(response.url),
+                )
                 return None
 
             if expect_json:
                 try:
-                    return response.json()
+                    data = response.json()
                 except Exception as exc:
                     last_error = exc
-                    print(
-                        f"[HTTP] JSON inválido en {label}: {exc}"
+
+                    if not register_retry(
+                        retailer,
+                        context=label,
+                        url=str(response.url),
+                        message=(
+                            f"JSON inválido en {label}: {exc}"
+                        ),
+                    ):
+                        return None
+
+                    time.sleep(
+                        min(4.0, 0.75 * attempt)
                     )
-                    time.sleep(0.5 * attempt)
                     continue
 
+                mark_site_success(retailer)
+                return data
+
+            mark_site_success(retailer)
             return response
+
+        except (
+            httpx.TimeoutException,
+            httpx.NetworkError,
+            httpx.RemoteProtocolError,
+        ) as exc:
+            last_error = exc
+
+            if not register_retry(
+                retailer,
+                context=label,
+                url=url,
+                message=(
+                    f"Error de conexión en {label}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ):
+                return None
+
+            if attempt < REQUEST_RETRIES:
+                time.sleep(
+                    min(8.0, 1.5 * attempt)
+                )
 
         except Exception as exc:
             last_error = exc
 
-            if attempt < REQUEST_RETRIES:
-                time.sleep(min(8, 1.25 * attempt))
+            if not register_retry(
+                retailer,
+                context=label,
+                url=url,
+                message=(
+                    f"Error inesperado en {label}: "
+                    f"{type(exc).__name__}: {exc}"
+                ),
+            ):
+                return None
 
-    if last_error:
-        print(f"[HTTP] Error final en {label}: {last_error}")
+            if attempt < REQUEST_RETRIES:
+                time.sleep(
+                    min(8.0, 1.5 * attempt)
+                )
+
+    register_request_failure(
+        retailer,
+        context=label,
+        message=(
+            f"Falló {label} después de "
+            f"{REQUEST_RETRIES} intentos. "
+            f"Último error: "
+            f"{last_error or 'respuesta no válida'}"
+        ),
+    )
 
     return None
-
 
 def add_query_param(url, **params):
     parsed = urlparse(url)
@@ -357,18 +769,42 @@ def bulk_write_safe(collection, operations, chunk_size=500):
     return total
 
 
-def save_batch(product_ops, history_ops, store_name, source_name):
-    if product_ops:
-        bulk_write_safe(products_col, product_ops)
+def save_batch(
+    product_ops,
+    history_ops,
+    store_name,
+    source_name,
+):
+    try:
+        if product_ops:
+            bulk_write_safe(
+                products_col,
+                product_ops,
+            )
 
-    if history_ops:
-        bulk_write_safe(history_col, history_ops)
+        if history_ops:
+            bulk_write_safe(
+                history_col,
+                history_ops,
+            )
 
-    print(
-        f"[{store_name}] {source_name}: "
-        f"{len(product_ops)} productos/SKU procesados."
-    )
+        print(
+            f"[{store_name}] {source_name}: "
+            f"{len(product_ops)} productos/SKU procesados."
+        )
 
+    except Exception as exc:
+        log_event(
+            store_name,
+            "ERROR",
+            "MONGO_WRITE_ERROR",
+            (
+                f"Error guardando lote '{source_name}': "
+                f"{type(exc).__name__}: {exc}"
+            ),
+            context=source_name,
+        )
+        raise
 
 def make_ops(
     *,
@@ -506,7 +942,11 @@ def flatten_vtex_categories(nodes, parents=None):
     return rows
 
 
-def get_vtex_categories(http, base_url, retailer):
+def get_vtex_categories(
+    http,
+    base_url,
+    retailer,
+):
     url = (
         f"{base_url}/api/catalog_system/"
         f"pub/category/tree/5"
@@ -516,15 +956,20 @@ def get_vtex_categories(http, base_url, retailer):
         http,
         "GET",
         url,
+        retailer=retailer,
         expect_json=True,
         label=f"{retailer} category tree",
     )
 
     if not isinstance(data, list):
-        print(
-            f"[{retailer}] No se pudo leer el árbol "
-            "de categorías VTEX."
-        )
+        if not is_site_blocked(retailer):
+            log_event(
+                retailer,
+                "WARNING",
+                "CATEGORY_TREE_EMPTY",
+                "No se pudo leer el árbol de categorías VTEX.",
+                context="category tree",
+            )
         return []
 
     categories = flatten_vtex_categories(data)
@@ -537,14 +982,17 @@ def get_vtex_categories(http, base_url, retailer):
 
     result = leaf_categories or categories
 
-    print(
-        f"[{retailer}] Árbol VTEX: "
-        f"{len(categories)} categorías, "
-        f"{len(leaf_categories)} hojas."
+    log_event(
+        retailer,
+        "INFO",
+        "CATEGORY_TREE_OK",
+        (
+            f"{len(categories)} categorías; "
+            f"{len(leaf_categories)} categorías hoja."
+        ),
     )
 
     return result
-
 
 def select_best_offer(sku_item):
     candidates = []
@@ -702,7 +1150,12 @@ def fetch_vtex_category(
     category_id = category["id"]
     category_path = category["path"]
 
-    for page in range(VTEX_MAX_PAGES_PER_CATEGORY):
+    for page in range(
+        VTEX_MAX_PAGES_PER_CATEGORY
+    ):
+        if is_site_blocked(retailer):
+            break
+
         start = page * VTEX_PAGE_SIZE
         end = start + VTEX_PAGE_SIZE - 1
 
@@ -722,6 +1175,7 @@ def fetch_vtex_category(
             http,
             "GET",
             url,
+            retailer=retailer,
             params=params,
             expect_json=True,
             label=(
@@ -736,21 +1190,27 @@ def fetch_vtex_category(
         if not items:
             break
 
-        product_ops, history_ops = process_vtex_items(
-            retailer=retailer,
-            base_url=base_url,
-            items=items,
-            category_path=category_path,
-            seen_skus=seen_skus,
+        product_ops, history_ops = (
+            process_vtex_items(
+                retailer=retailer,
+                base_url=base_url,
+                items=items,
+                category_path=category_path,
+                seen_skus=seen_skus,
+            )
         )
 
-        all_product_ops.extend(product_ops)
-        all_history_ops.extend(history_ops)
+        all_product_ops.extend(
+            product_ops
+        )
+        all_history_ops.extend(
+            history_ops
+        )
 
         if len(items) < VTEX_PAGE_SIZE:
             break
 
-        time.sleep(REQUEST_DELAY)
+        polite_sleep(retailer)
 
     if all_product_ops:
         save_batch(
@@ -762,20 +1222,20 @@ def fetch_vtex_category(
 
     return len(all_product_ops)
 
-
 def fetch_vtex_global_fallback(
     http,
     retailer,
     base_url,
     seen_skus,
 ):
-    """
-    Fallback sin palabras clave. Se usa únicamente si el árbol
-    de categorías no está disponible.
-    """
     total = 0
 
-    for page in range(VTEX_MAX_PAGES_PER_CATEGORY):
+    for page in range(
+        VTEX_MAX_PAGES_PER_CATEGORY
+    ):
+        if is_site_blocked(retailer):
+            break
+
         start = page * VTEX_PAGE_SIZE
         end = start + VTEX_PAGE_SIZE - 1
 
@@ -788,24 +1248,33 @@ def fetch_vtex_global_fallback(
             http,
             "GET",
             url,
+            retailer=retailer,
             params={
                 "_from": start,
                 "_to": end,
                 "O": "OrderByNameASC",
             },
             expect_json=True,
-            label=f"{retailer} global page={page + 1}",
+            label=(
+                f"{retailer} global "
+                f"page={page + 1}"
+            ),
         )
 
-        if not isinstance(items, list) or not items:
+        if not isinstance(items, list):
             break
 
-        product_ops, history_ops = process_vtex_items(
-            retailer=retailer,
-            base_url=base_url,
-            items=items,
-            category_path="Catálogo general",
-            seen_skus=seen_skus,
+        if not items:
+            break
+
+        product_ops, history_ops = (
+            process_vtex_items(
+                retailer=retailer,
+                base_url=base_url,
+                items=items,
+                category_path="Catálogo general",
+                seen_skus=seen_skus,
+            )
         )
 
         if product_ops:
@@ -821,15 +1290,25 @@ def fetch_vtex_global_fallback(
         if len(items) < VTEX_PAGE_SIZE:
             break
 
-        time.sleep(REQUEST_DELAY)
+        polite_sleep(retailer)
 
     return total
 
+def fetch_vtex_catalog(
+    retailer,
+    base_url,
+):
+    reset_site_state(retailer)
+    update_run_store(
+        retailer,
+        status="running",
+    )
 
-def fetch_vtex_catalog(retailer, base_url):
-    print(
-        f"\n[{retailer}] Iniciando barrido VTEX "
-        "por árbol de categorías..."
+    log_event(
+        retailer,
+        "INFO",
+        "SITE_START",
+        "Iniciando barrido VTEX.",
     )
 
     seen_skus = set()
@@ -851,6 +1330,9 @@ def fetch_vtex_catalog(retailer, base_url):
                 categories,
                 start=1,
             ):
+                if is_site_blocked(retailer):
+                    break
+
                 print(
                     f"[{retailer}] Categoría "
                     f"{index}/{len(categories)}: "
@@ -864,26 +1346,59 @@ def fetch_vtex_catalog(retailer, base_url):
                     category=category,
                     seen_skus=seen_skus,
                 )
-        else:
-            print(
-                f"[{retailer}] Usando barrido global "
-                "de respaldo."
-            )
 
-            total = fetch_vtex_global_fallback(
-                http,
+                get_site_state(retailer)[
+                    "products"
+                ] = len(seen_skus)
+
+        elif not is_site_blocked(retailer):
+            log_event(
                 retailer,
-                base_url,
-                seen_skus,
+                "WARNING",
+                "VTEX_GLOBAL_FALLBACK",
+                (
+                    "Árbol de categorías no disponible; "
+                    "se intenta barrido global."
+                ),
             )
 
-    print(
-        f"[{retailer}] FINAL: "
-        f"{len(seen_skus)} SKU únicos capturados."
-    )
+            total = (
+                fetch_vtex_global_fallback(
+                    http,
+                    retailer,
+                    base_url,
+                    seen_skus,
+                )
+            )
+
+    state = get_site_state(retailer)
+    state["products"] = len(seen_skus)
+
+    if state["blocked"]:
+        update_run_store(
+            retailer,
+            status="skipped",
+            products=len(seen_skus),
+            reason=state["reason"],
+        )
+    else:
+        log_event(
+            retailer,
+            "INFO",
+            "SITE_COMPLETE",
+            (
+                f"Barrido finalizado: "
+                f"{len(seen_skus)} SKU únicos."
+            ),
+        )
+
+        update_run_store(
+            retailer,
+            status="completed",
+            products=len(seen_skus),
+        )
 
     return total
-
 
 # =========================================================
 # GENERIC HTML / MAGENTO HELPERS
@@ -937,20 +1452,27 @@ def discover_category_urls(
     http,
     home_url,
     *,
+    retailer,
     markers,
     max_urls=160,
     crawl_depth=1,
 ):
-    """
-    Descubre categorías desde navegación visible.
-    Esto evita depender exclusivamente de 5 palabras clave.
-    """
     discovered = set()
     visited = set()
-    queue = deque([(home_url, 0)])
+    queue = deque(
+        [(home_url, 0)]
+    )
 
-    while queue and len(discovered) < max_urls:
-        current_url, depth = queue.popleft()
+    while (
+        queue
+        and len(discovered) < max_urls
+    ):
+        if is_site_blocked(retailer):
+            break
+
+        current_url, depth = (
+            queue.popleft()
+        )
 
         if current_url in visited:
             continue
@@ -961,10 +1483,17 @@ def discover_category_urls(
             http,
             "GET",
             current_url,
-            label=f"discover {current_url}",
+            retailer=retailer,
+            label=(
+                f"discover {current_url}"
+            ),
         )
 
         if response is None:
+            if is_site_blocked(
+                retailer
+            ):
+                break
             continue
 
         soup = BeautifulSoup(
@@ -972,17 +1501,28 @@ def discover_category_urls(
             "html.parser",
         )
 
-        for anchor in soup.select("a[href]"):
-            href = clean_text(anchor.get("href"))
+        for anchor in soup.select(
+            "a[href]"
+        ):
+            href = clean_text(
+                anchor.get("href")
+            )
 
             if not href:
                 continue
 
-            absolute = urljoin(current_url, href)
+            absolute = urljoin(
+                current_url,
+                href,
+            )
+
             parsed = urlparse(absolute)
             path = parsed.path.lower()
 
-            if not same_host(home_url, absolute):
+            if not same_host(
+                home_url,
+                absolute,
+            ):
                 continue
 
             if any(
@@ -1000,7 +1540,10 @@ def discover_category_urls(
             ):
                 continue
 
-            if any(marker in path for marker in markers):
+            if any(
+                marker in path
+                for marker in markers
+            ):
                 cleaned = urlunparse(
                     parsed._replace(
                         query="",
@@ -1012,16 +1555,19 @@ def discover_category_urls(
 
                 if (
                     depth < crawl_depth
-                    and cleaned not in visited
+                    and cleaned
+                    not in visited
                 ):
                     queue.append(
-                        (cleaned, depth + 1)
+                        (
+                            cleaned,
+                            depth + 1,
+                        )
                     )
 
-        time.sleep(REQUEST_DELAY)
+        polite_sleep(retailer)
 
     return sorted(discovered)
-
 
 def find_product_cards(soup):
     selectors = [
@@ -1209,7 +1755,13 @@ def scan_html_listing(
     total = 0
     empty_streak = 0
 
-    for page in range(1, max_pages + 1):
+    for page in range(
+        1,
+        max_pages + 1,
+    ):
+        if is_site_blocked(retailer):
+            break
+
         page_url = add_query_param(
             listing_url,
             **{page_param: page},
@@ -1219,6 +1771,7 @@ def scan_html_listing(
             http,
             "GET",
             page_url,
+            retailer=retailer,
             label=(
                 f"{retailer} {category_name} "
                 f"page={page}"
@@ -1233,7 +1786,9 @@ def scan_html_listing(
             "html.parser",
         )
 
-        cards = find_product_cards(soup)
+        cards = find_product_cards(
+            soup
+        )
 
         if not cards:
             empty_streak += 1
@@ -1248,9 +1803,11 @@ def scan_html_listing(
         new_on_page = 0
 
         for card in cards:
-            parsed = parse_html_product_card(
-                card,
-                listing_url,
+            parsed = (
+                parse_html_product_card(
+                    card,
+                    listing_url,
+                )
             )
 
             if not parsed:
@@ -1261,28 +1818,41 @@ def scan_html_listing(
             if not sku:
                 continue
 
-            identity = (retailer, sku)
+            identity = (
+                retailer,
+                sku,
+            )
 
             if identity in seen_skus:
                 continue
 
-            product_op, history_op = make_ops(
-                retailer=retailer,
-                sku=sku,
-                title=parsed["title"],
-                brand=parsed["brand"],
-                url=parsed["url"],
-                image_url=parsed["image_url"],
-                category=category_name,
-                regular_price=parsed["regular_price"],
-                offer_price=parsed["offer_price"],
-                model=parsed["model"],
-                ean=parsed["ean"],
-                source="html",
+            product_op, history_op = (
+                make_ops(
+                    retailer=retailer,
+                    sku=sku,
+                    title=parsed["title"],
+                    brand=parsed["brand"],
+                    url=parsed["url"],
+                    image_url=parsed["image_url"],
+                    category=category_name,
+                    regular_price=parsed[
+                        "regular_price"
+                    ],
+                    offer_price=parsed[
+                        "offer_price"
+                    ],
+                    model=parsed["model"],
+                    ean=parsed["ean"],
+                    source="html",
+                )
             )
 
-            product_ops.append(product_op)
-            history_ops.append(history_op)
+            product_ops.append(
+                product_op
+            )
+            history_ops.append(
+                history_op
+            )
             seen_skus.add(identity)
             new_on_page += 1
 
@@ -1296,8 +1866,10 @@ def scan_html_listing(
 
         total += new_on_page
 
-        # Si una página tiene cards pero ya todas eran repetidas,
-        # seguimos una página más; dos seguidas no aportan valor.
+        get_site_state(retailer)[
+            "products"
+        ] = len(seen_skus)
+
         if new_on_page == 0:
             empty_streak += 1
         else:
@@ -1306,10 +1878,9 @@ def scan_html_listing(
         if empty_streak >= 2:
             break
 
-        time.sleep(REQUEST_DELAY)
+        polite_sleep(retailer)
 
     return total
-
 
 # =========================================================
 # MAGENTO: LA CURACAO + PRADO
@@ -1372,9 +1943,20 @@ def fetch_magento_store(
     home_url,
     search_base_url,
 ):
-    print(
-        f"\n[{retailer}] Iniciando barrido "
-        "de categorías HTML/Magento..."
+    reset_site_state(retailer)
+    update_run_store(
+        retailer,
+        status="running",
+    )
+
+    log_event(
+        retailer,
+        "INFO",
+        "SITE_START",
+        (
+            "Iniciando barrido "
+            "HTML/Magento."
+        ),
     )
 
     seen_skus = set()
@@ -1385,28 +1967,41 @@ def fetch_magento_store(
         headers=HEADERS,
         follow_redirects=True,
     ) as http:
-        category_urls = discover_category_urls(
-            http,
-            home_url,
-            markers=(
-                "/c/",
-                "/categoria/",
-                "/category/",
-                "/categorias/",
+        category_urls = (
+            discover_category_urls(
+                http,
+                home_url,
+                retailer=retailer,
+                markers=(
+                    "/c/",
+                    "/categoria/",
+                    "/category/",
+                    "/categorias/",
+                ),
+                max_urls=180,
+                crawl_depth=1,
+            )
+        )
+
+        log_event(
+            retailer,
+            "INFO",
+            "CATEGORIES_DISCOVERED",
+            (
+                f"{len(category_urls)} "
+                "categorías descubiertas."
             ),
-            max_urls=180,
-            crawl_depth=1,
         )
 
-        print(
-            f"[{retailer}] Categorías descubiertas: "
-            f"{len(category_urls)}"
-        )
-
-        for index, category_url in enumerate(
-            category_urls,
-            start=1,
+        for index, category_url in (
+            enumerate(
+                category_urls,
+                start=1,
+            )
         ):
+            if is_site_blocked(retailer):
+                break
+
             path = (
                 urlparse(category_url)
                 .path.rstrip("/")
@@ -1421,32 +2016,61 @@ def fetch_magento_store(
                 seen_skus=seen_skus,
             )
 
-        # Search fallback complementa categorías que la navegación
-        # no dejó visibles en el HTML.
-        for term in MAGENTO_FALLBACK_TERMS.get(
+        # Complemento por búsqueda solamente si el sitio sigue sano.
+        if not is_site_blocked(retailer):
+            for term in (
+                MAGENTO_FALLBACK_TERMS
+                .get(retailer, [])
+            ):
+                if is_site_blocked(retailer):
+                    break
+
+                search_url = add_query_param(
+                    search_base_url,
+                    q=term,
+                )
+
+                total += (
+                    scan_html_listing(
+                        http,
+                        retailer=retailer,
+                        listing_url=search_url,
+                        category_name=(
+                            f"search:{term}"
+                        ),
+                        seen_skus=seen_skus,
+                    )
+                )
+
+    state = get_site_state(retailer)
+    state["products"] = len(seen_skus)
+
+    if state["blocked"]:
+        update_run_store(
             retailer,
-            [],
-        ):
-            search_url = add_query_param(
-                search_base_url,
-                q=term,
-            )
+            status="skipped",
+            products=len(seen_skus),
+            reason=state["reason"],
+        )
+    else:
+        log_event(
+            retailer,
+            "INFO",
+            "SITE_COMPLETE",
+            (
+                f"Barrido finalizado: "
+                f"{len(seen_skus)} "
+                "productos únicos."
+            ),
+        )
 
-            total += scan_html_listing(
-                http,
-                retailer=retailer,
-                listing_url=search_url,
-                category_name=f"search:{term}",
-                seen_skus=seen_skus,
-            )
-
-    print(
-        f"[{retailer}] FINAL: "
-        f"{len(seen_skus)} productos únicos."
-    )
+        update_run_store(
+            retailer,
+            status="completed",
+            products=len(seen_skus),
+        )
 
     return total
-
 
 # =========================================================
 # OMNISPORT
@@ -1469,11 +2093,24 @@ OMNISPORT_FALLBACK_CATEGORIES = [
 
 def fetch_omnisport_catalog():
     retailer = "omnisport"
-    home_url = "https://www.omnisport.com"
+    home_url = (
+        "https://www.omnisport.com"
+    )
 
-    print(
-        "\n[omnisport] Iniciando descubrimiento "
-        "de categorías..."
+    reset_site_state(retailer)
+    update_run_store(
+        retailer,
+        status="running",
+    )
+
+    log_event(
+        retailer,
+        "INFO",
+        "SITE_START",
+        (
+            "Iniciando descubrimiento "
+            "de categorías Omnisport."
+        ),
     )
 
     seen_skus = set()
@@ -1484,29 +2121,40 @@ def fetch_omnisport_catalog():
         headers=HEADERS,
         follow_redirects=True,
     ) as http:
-        category_urls = discover_category_urls(
-            http,
-            home_url,
-            markers=("/categorias/",),
-            max_urls=160,
-            crawl_depth=1,
+        category_urls = (
+            discover_category_urls(
+                http,
+                home_url,
+                retailer=retailer,
+                markers=(
+                    "/categorias/",
+                ),
+                max_urls=160,
+                crawl_depth=1,
+            )
         )
 
-        if not category_urls:
+        if (
+            not category_urls
+            and not is_site_blocked(
+                retailer
+            )
+        ):
             category_urls = [
                 (
                     "https://www.omnisport.com/"
                     f"categorias/{slug}"
                 )
-                for slug in OMNISPORT_FALLBACK_CATEGORIES
+                for slug
+                in OMNISPORT_FALLBACK_CATEGORIES
             ]
 
-        print(
-            f"[omnisport] Categorías a revisar: "
-            f"{len(category_urls)}"
-        )
+        for category_url in (
+            category_urls
+        ):
+            if is_site_blocked(retailer):
+                break
 
-        for category_url in category_urls:
             slug = (
                 urlparse(category_url)
                 .path.rstrip("/")
@@ -1522,13 +2170,35 @@ def fetch_omnisport_catalog():
                 seen_skus=seen_skus,
             )
 
-    print(
-        f"[omnisport] FINAL: "
-        f"{len(seen_skus)} productos únicos."
-    )
+    state = get_site_state(retailer)
+    state["products"] = len(seen_skus)
+
+    if state["blocked"]:
+        update_run_store(
+            retailer,
+            status="skipped",
+            products=len(seen_skus),
+            reason=state["reason"],
+        )
+    else:
+        log_event(
+            retailer,
+            "INFO",
+            "SITE_COMPLETE",
+            (
+                f"Barrido finalizado: "
+                f"{len(seen_skus)} "
+                "productos únicos."
+            ),
+        )
+
+        update_run_store(
+            retailer,
+            status="completed",
+            products=len(seen_skus),
+        )
 
     return total
-
 
 # =========================================================
 # DIAGNOSTICS
@@ -1569,56 +2239,215 @@ def print_database_summary():
 # =========================================================
 # RUN
 # =========================================================
+def execute_store(
+    retailer,
+    func,
+):
+    """
+    Un error inesperado de una tienda no detiene las demás.
+    """
+    try:
+        return func()
+
+    except Exception as exc:
+        state = get_site_state(retailer)
+        state["reason"] = (
+            f"{type(exc).__name__}: {exc}"
+        )
+
+        log_event(
+            retailer,
+            "ERROR",
+            "STORE_UNHANDLED_ERROR",
+            (
+                f"Error no controlado: "
+                f"{type(exc).__name__}: {exc}"
+            ),
+        )
+
+        update_run_store(
+            retailer,
+            status="failed",
+            products=state.get(
+                "products",
+                0,
+            ),
+            reason=state["reason"],
+        )
+
+        return 0
+
+
 def run():
+    started_at = utc_now()
+
     print("=" * 64)
-    print("ComparaBlack SV - Tracker 2.0")
     print(
-        "Modo: catálogo amplio, categorías dinámicas "
-        "y paginación completa"
+        "ComparaBlack SV - "
+        "Tracker 3.0"
+    )
+    print(
+        "Catálogo amplio + circuit breaker "
+        "+ logs persistentes"
+    )
+    print(
+        f"Run ID: {RUN_ID}"
+    )
+    print(
+        "Máximo de reintentos consecutivos "
+        f"por sitio: {SITE_MAX_RETRY_EVENTS}"
     )
     print("=" * 64)
+
+    try:
+        tracker_runs_col.update_one(
+            {"run_id": RUN_ID},
+            {
+                "$set": {
+                    "run_id": RUN_ID,
+                    "started_at": started_at,
+                    "status": "running",
+                    "max_retry_events": (
+                        SITE_MAX_RETRY_EVENTS
+                    ),
+                }
+            },
+            upsert=True,
+        )
+    except Exception as exc:
+        print(
+            f"[RUN] No se pudo crear "
+            f"tracker_runs: {exc}"
+        )
 
     ensure_indexes()
 
-    # Siman y Walmart:
-    # Ya NO dependen de cinco términos de tecnología/línea blanca.
-    fetch_vtex_catalog(
-        "siman",
-        "https://sv.siman.com",
-    )
-
-    fetch_vtex_catalog(
-        "walmart",
-        "https://www.walmart.com.sv",
-    )
-
-    # La Curacao / Prado:
-    # Descubrimos categorías navegables y luego complementamos
-    # con búsquedas amplias.
-    fetch_magento_store(
-        "lacuracao",
-        "https://www.lacuracaonline.com/elsalvador/",
+    stores = [
         (
-            "https://www.lacuracaonline.com/"
-            "elsalvador/catalogsearch/result/"
+            "siman",
+            lambda: fetch_vtex_catalog(
+                "siman",
+                "https://sv.siman.com",
+            ),
         ),
-    )
-
-    fetch_magento_store(
-        "prado",
-        "https://www.prado.com.sv/",
         (
-            "https://www.prado.com.sv/"
-            "catalogsearch/result/"
+            "walmart",
+            lambda: fetch_vtex_catalog(
+                "walmart",
+                "https://www.walmart.com.sv",
+            ),
         ),
-    )
+        (
+            "lacuracao",
+            lambda: fetch_magento_store(
+                "lacuracao",
+                (
+                    "https://www.lacuracaonline.com/"
+                    "elsalvador/"
+                ),
+                (
+                    "https://www.lacuracaonline.com/"
+                    "elsalvador/catalogsearch/result/"
+                ),
+            ),
+        ),
+        (
+            "prado",
+            lambda: fetch_magento_store(
+                "prado",
+                "https://www.prado.com.sv/",
+                (
+                    "https://www.prado.com.sv/"
+                    "catalogsearch/result/"
+                ),
+            ),
+        ),
+        (
+            "omnisport",
+            fetch_omnisport_catalog,
+        ),
+    ]
 
-    fetch_omnisport_catalog()
+    for retailer, func in stores:
+        execute_store(
+            retailer,
+            func,
+        )
 
     print_database_summary()
 
-    print("\nEscaneo finalizado.")
+    finished_at = utc_now()
 
+    skipped = [
+        retailer
+        for retailer, state
+        in SITE_STATE.items()
+        if state.get("blocked")
+    ]
 
-if __name__ == "__main__":
-    run()
+    failed = []
+
+    try:
+        run_doc = (
+            tracker_runs_col.find_one(
+                {"run_id": RUN_ID}
+            )
+            or {}
+        )
+
+        for retailer, info in (
+            run_doc.get(
+                "stores",
+                {},
+            )
+        ).items():
+            if (
+                info.get("status")
+                == "failed"
+            ):
+                failed.append(retailer)
+    except Exception:
+        pass
+
+    final_status = (
+        "partial"
+        if skipped or failed
+        else "completed"
+    )
+
+    try:
+        tracker_runs_col.update_one(
+            {"run_id": RUN_ID},
+            {
+                "$set": {
+                    "finished_at": finished_at,
+                    "status": final_status,
+                    "skipped_stores": skipped,
+                    "failed_stores": failed,
+                }
+            },
+        )
+    except Exception as exc:
+        print(
+            f"[RUN] No se pudo cerrar "
+            f"tracker_runs: {exc}"
+        )
+
+    log_event(
+        "system",
+        "INFO",
+        "RUN_COMPLETE",
+        (
+            f"Ejecución {final_status}. "
+            f"Omitidos: "
+            f"{', '.join(skipped) if skipped else 'ninguno'}. "
+            f"Fallidos: "
+            f"{', '.join(failed) if failed else 'ninguno'}."
+        ),
+    )
+
+    print(
+        f"\nEscaneo finalizado: "
+        f"{final_status}."
+    )
+
