@@ -22,7 +22,6 @@ history_col = db["price_history"]
 def send_telegram_alert(message: str):
     """Envía notificaciones directas a Telegram."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print(f"[Telegram skipped] {message}")
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
     payload = {
@@ -38,15 +37,10 @@ def send_telegram_alert(message: str):
         print(f"Error enviando alerta a Telegram: {e}")
 
 def audit_price_and_notify(retailer: str, sku: str, title: str, current_price: float, regular_price: float, url: str):
-    """
-    Audita el precio contra el historial de los últimos 45 días:
-    - Detecta rebaja real vs mínimo histórico.
-    - Detecta inflación previa de precio.
-    """
+    """Audita si es una rebaja real o inflación previa."""
     now = datetime.now(timezone.utc)
     threshold_date = now - timedelta(days=45)
 
-    # Buscar historial reciente del producto
     recent_records = list(history_col.find({
         "retailer": retailer,
         "sku": sku,
@@ -61,10 +55,9 @@ def audit_price_and_notify(retailer: str, sku: str, title: str, current_price: f
         return
 
     min_historical = min(past_prices)
-    max_historical = max(past_prices)
     price_15_days_ago = recent_records[0]["offer_price"]
 
-    # Caso 1: Oferta Real (El precio actual rompe el mínimo de los últimos 45 días por más del 10%)
+    # Caso 1: Oferta Real (>10% por debajo del mínimo de 45 días)
     if current_price < (min_historical * 0.90):
         drop_pct = round(((min_historical - current_price) / min_historical) * 100, 1)
         msg = (
@@ -78,7 +71,7 @@ def audit_price_and_notify(retailer: str, sku: str, title: str, current_price: f
         )
         send_telegram_alert(msg)
 
-    # Caso 2: Alerta Antifraude (Subieron el precio regular repentinamente antes de Black Friday)
+    # Caso 2: Inflación Artificial previa a Black Friday
     elif regular_price > (price_15_days_ago * 1.25) and current_price >= price_15_days_ago:
         msg = (
             f"⚠️ *INFLACIÓN ARTIFICIAL DETECTADA*\n\n"
@@ -90,29 +83,41 @@ def audit_price_and_notify(retailer: str, sku: str, title: str, current_price: f
         )
         send_telegram_alert(msg)
 
-def fetch_vtex_store(retailer: str, base_url: str, category_id: str, max_pages: int = 4):
-    """
-    Rastreador genérico para tiendas montadas sobre VTEX (Siman, La Curacao, etc.).
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+def fetch_vtex_store(retailer: str, base_url: str, category_slug: str, max_pages: int = 3):
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+        "Accept": "application/json"
+    }
     today_str = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     
+    total_found = 0
     product_ops = []
     history_ops = []
     
-    with httpx.Client(timeout=20, headers=headers) as http:
+    with httpx.Client(timeout=25, headers=headers, follow_redirects=True) as http:
         for page in range(1, max_pages + 1):
             _from = (page - 1) * 30
             _to = (page * 30) - 1
-            endpoint = f"{base_url}/api/catalog_system/pub/products/search?fq=C:/{category_id}/&_from={_from}&_to={_to}"
+            
+            # Intento 1: Búsqueda directa por ruta de categoría
+            endpoint = f"{base_url}/api/catalog_system/pub/products/search/{category_slug}?_from={_from}&_to={_to}"
             
             try:
                 resp = http.get(endpoint)
-                if resp.status_code != 200:
-                    break
-                items = resp.json()
+                items = resp.json() if resp.status_code == 200 else []
+                
+                # Intento 2 (Fallback): Búsqueda full-text si la ruta directa vino vacía
                 if not items:
+                    alt_endpoint = f"{base_url}/api/catalog_system/pub/products/search?ft={category_slug}&_from={_from}&_to={_to}"
+                    alt_resp = http.get(alt_endpoint)
+                    if alt_resp.status_code == 200:
+                        items = alt_resp.json()
+
+                if not items:
+                    print(f"[{retailer}] Sin más resultados para '{category_slug}' en pág {page}.")
                     break
+
+                print(f"[{retailer}] Página {page}: obtenidos {len(items)} productos para '{category_slug}'.")
 
                 for item in items:
                     sku = str(item.get("productId", ""))
@@ -121,18 +126,24 @@ def fetch_vtex_store(retailer: str, base_url: str, category_id: str, max_pages: 
                     link = item.get("linkText", "")
                     url = f"{base_url}/{link}/p" if link else base_url
 
-                    # Extraer precios de los sellers
-                    sellers = item.get("items", [{}])[0].get("sellers", [{}])[0].get("commertialOffer", {})
-                    regular_price = float(sellers.get("ListPrice", 0.0))
-                    offer_price = float(sellers.get("Price", 0.0))
+                    # Precios del primer SKU disponible
+                    item_skus = item.get("items", [])
+                    if not item_skus:
+                        continue
+                    sellers = item_skus[0].get("sellers", [])
+                    if not sellers:
+                        continue
+                        
+                    comm_offer = sellers[0].get("commertialOffer", {})
+                    regular_price = float(comm_offer.get("ListPrice", 0.0))
+                    offer_price = float(comm_offer.get("Price", 0.0))
 
                     if offer_price <= 0:
                         continue
 
-                    # Auditar con precios pasados
+                    total_found += 1
                     audit_price_and_notify(retailer, sku, title, offer_price, regular_price, url)
 
-                    # Guardar catálogo base
                     product_ops.append(
                         UpdateOne(
                             {"retailer": retailer, "sku": sku},
@@ -140,13 +151,13 @@ def fetch_vtex_store(retailer: str, base_url: str, category_id: str, max_pages: 
                                 "title": title,
                                 "brand": brand,
                                 "url": url,
+                                "category": category_slug,
                                 "last_updated": datetime.now(timezone.utc)
                             }},
                             upsert=True
                         )
                     )
 
-                    # Guardar snapshot diario
                     history_ops.append(
                         UpdateOne(
                             {"retailer": retailer, "sku": sku, "date": today_str},
@@ -160,34 +171,34 @@ def fetch_vtex_store(retailer: str, base_url: str, category_id: str, max_pages: 
                     )
 
             except Exception as e:
-                print(f"Error en {retailer} categoría {category_id} página {page}: {e}")
+                print(f"[{retailer}] Error en {category_slug} pág {page}: {e}")
                 break
 
     if product_ops:
         products_col.bulk_write(product_ops)
     if history_ops:
         history_col.bulk_write(history_ops)
-    print(f"[{retailer}] Procesados {len(product_ops)} productos en categoría {category_id}.")
+        
+    print(f"[{retailer}] Total guardados: {total_found} en '{category_slug}'.")
 
 def run():
     print("Iniciando escaneo de precios...")
-    
-    # Categorías clave para El Salvador
-    # Formato: (Nombre, Base URL, Category ID)
-    # Nota: Los IDs de categoría se confirman inspeccionando las URLs de los departamentos
-    vtex_targets = [
-        # Siman El Salvador
+
+    # Tiendas y categorías clave en El Salvador
+    targets = [
+        # Siman SV
         ("siman", "https://sv.siman.com", "tecnologia", 3),
         ("siman", "https://sv.siman.com", "linea-blanca", 3),
         ("siman", "https://sv.siman.com", "climatizacion", 2),
         
-        # La Curacao El Salvador
-        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "tecnologia", 3),
-        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "electrodomesticos", 3),
-        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "aires-acondicionados", 2),
+        # La Curacao SV
+        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "refrigeradoras", 2),
+        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "televisores", 2),
+        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "celulares", 2),
+        ("lacuracao", "https://www.lacuracaonline.com/elsalvador", "aires acondicionados", 2),
     ]
 
-    for retailer, base_url, cat, pages in vtex_targets:
+    for retailer, base_url, cat, pages in targets:
         fetch_vtex_store(retailer, base_url, cat, max_pages=pages)
 
     print("Escaneo finalizado correctamente.")
