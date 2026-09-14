@@ -1,6 +1,7 @@
 import os
 import re
 from collections import defaultdict
+from difflib import SequenceMatcher
 
 import pandas as pd
 import plotly.express as px
@@ -347,6 +348,7 @@ except Exception as exc:
 
 products_col = db["products"]
 history_col = db["price_history"]
+comparison_sets_col = db["comparison_sets"]
 
 
 # =========================================================
@@ -420,7 +422,14 @@ def load_products(search_text="", stores=(), limit=120):
         "offer_price": 1,
         "regular_price": 1,
         "price": 1,
-        "updated_at": 1,
+        "model": 1,
+        "ean": 1,
+        "reference_id": 1,
+        "comparison_key": 1,
+        "product_id": 1,
+        "stock": 1,
+        "available": 1,
+        "last_updated": 1,
     }
 
     return list(products_col.find(filt, projection).limit(limit))
@@ -466,6 +475,520 @@ def load_global_metrics():
     total = products_col.count_documents({})
     stores = len(products_col.distinct("retailer"))
     return total, stores
+
+
+# =========================================================
+# FIXED COMPARISON / WATCHLIST HELPERS
+# =========================================================
+def normalize_match_text(value):
+    value = str(value or "").upper()
+    value = re.sub(r"[^A-Z0-9]+", " ", value)
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def normalize_compact(value):
+    return re.sub(
+        r"[^A-Z0-9]+",
+        "",
+        str(value or "").upper(),
+    )
+
+
+def significant_tokens(value):
+    text = normalize_match_text(value)
+
+    stopwords = {
+        "DE", "LA", "EL", "EN", "CON", "PARA",
+        "SMART", "TV", "LED", "LCD", "OLED", "QLED",
+        "UHD", "FHD", "HD", "4K", "8K", "WIFI",
+        "NEGRO", "BLANCO", "GRIS", "PLATEADO",
+        "PULGADAS", "PULGADA",
+    }
+
+    tokens = []
+
+    for token in text.split():
+        if token in stopwords:
+            continue
+
+        if len(token) < 3:
+            continue
+
+        tokens.append(token)
+
+    # Primero los tokens que parecen modelo.
+    tokens.sort(
+        key=lambda token: (
+            any(ch.isdigit() for ch in token)
+            and any(ch.isalpha() for ch in token),
+            len(token),
+        ),
+        reverse=True,
+    )
+
+    return tokens
+
+
+def match_score(anchor, candidate):
+    anchor_ean = normalize_compact(anchor.get("ean"))
+    candidate_ean = normalize_compact(candidate.get("ean"))
+
+    anchor_model = normalize_compact(anchor.get("model"))
+    candidate_model = normalize_compact(candidate.get("model"))
+
+    anchor_brand = normalize_match_text(anchor.get("brand"))
+    candidate_brand = normalize_match_text(candidate.get("brand"))
+
+    anchor_title = normalize_match_text(anchor.get("title"))
+    candidate_title = normalize_match_text(candidate.get("title"))
+
+    score = 0.0
+
+    if (
+        anchor_ean
+        and candidate_ean
+        and anchor_ean == candidate_ean
+    ):
+        score += 1000
+
+    if (
+        anchor_model
+        and candidate_model
+        and anchor_model == candidate_model
+    ):
+        score += 600
+
+    elif anchor_model and anchor_model in normalize_compact(
+        candidate.get("title")
+    ):
+        score += 420
+
+    if (
+        anchor_brand
+        and candidate_brand
+        and anchor_brand == candidate_brand
+    ):
+        score += 100
+
+    a_tokens = set(significant_tokens(anchor_title))
+    c_tokens = set(significant_tokens(candidate_title))
+
+    if a_tokens and c_tokens:
+        jaccard = len(a_tokens & c_tokens) / len(
+            a_tokens | c_tokens
+        )
+        score += jaccard * 180
+
+    score += (
+        SequenceMatcher(
+            None,
+            anchor_title,
+            candidate_title,
+        ).ratio()
+        * 120
+    )
+
+    return round(score, 2)
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def find_match_candidates(
+    store,
+    anchor_title,
+    anchor_brand="",
+    anchor_model="",
+    anchor_ean="",
+    anchor_comparison_key="",
+    limit=30,
+):
+    clauses = []
+
+    if anchor_comparison_key:
+        clauses.append(
+            {
+                "comparison_key": (
+                    anchor_comparison_key
+                )
+            }
+        )
+
+    if anchor_ean:
+        clauses.extend(
+            [
+                {"ean": anchor_ean},
+                {
+                    "title": {
+                        "$regex": re.escape(
+                            anchor_ean
+                        ),
+                        "$options": "i",
+                    }
+                },
+            ]
+        )
+
+    if anchor_model:
+        clauses.extend(
+            [
+                {
+                    "model": {
+                        "$regex": (
+                            f"^{re.escape(anchor_model)}$"
+                        ),
+                        "$options": "i",
+                    }
+                },
+                {
+                    "title": {
+                        "$regex": re.escape(
+                            anchor_model
+                        ),
+                        "$options": "i",
+                    }
+                },
+                {
+                    "reference_id": {
+                        "$regex": re.escape(
+                            anchor_model
+                        ),
+                        "$options": "i",
+                    }
+                },
+            ]
+        )
+
+    for token in significant_tokens(
+        anchor_title
+    )[:4]:
+        clauses.append(
+            {
+                "title": {
+                    "$regex": re.escape(token),
+                    "$options": "i",
+                }
+            }
+        )
+
+    query = {"retailer": store}
+
+    if clauses:
+        query["$or"] = clauses
+
+    projection = {
+        "title": 1,
+        "brand": 1,
+        "model": 1,
+        "ean": 1,
+        "reference_id": 1,
+        "comparison_key": 1,
+        "sku": 1,
+        "retailer": 1,
+        "url": 1,
+        "image_url": 1,
+        "offer_price": 1,
+        "regular_price": 1,
+        "last_updated": 1,
+    }
+
+    candidates = list(
+        products_col.find(
+            query,
+            projection,
+        ).limit(250)
+    )
+
+    # Si la consulta fue demasiado específica,
+    # ampliamos a marca.
+    if len(candidates) < 3 and anchor_brand:
+        brand_query = {
+            "retailer": store,
+            "$or": [
+                {
+                    "brand": {
+                        "$regex": (
+                            f"^{re.escape(anchor_brand)}$"
+                        ),
+                        "$options": "i",
+                    }
+                },
+                {
+                    "title": {
+                        "$regex": re.escape(
+                            anchor_brand
+                        ),
+                        "$options": "i",
+                    }
+                },
+            ],
+        }
+
+        more = list(
+            products_col.find(
+                brand_query,
+                projection,
+            ).limit(200)
+        )
+
+        known = {
+            str(item.get("sku"))
+            for item in candidates
+        }
+
+        for item in more:
+            if str(item.get("sku")) not in known:
+                candidates.append(item)
+
+    anchor = {
+        "title": anchor_title,
+        "brand": anchor_brand,
+        "model": anchor_model,
+        "ean": anchor_ean,
+    }
+
+    for candidate in candidates:
+        candidate["_match_score"] = (
+            match_score(
+                anchor,
+                candidate,
+            )
+        )
+
+    candidates.sort(
+        key=lambda item: item.get(
+            "_match_score",
+            0,
+        ),
+        reverse=True,
+    )
+
+    return candidates[:limit]
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def load_comparison_sets():
+    return list(
+        comparison_sets_col.find(
+            {"active": {"$ne": False}}
+        ).sort("updated_at", -1)
+    )
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def load_products_by_keys(keys):
+    pairs = [
+        (store, sku)
+        for store, sku in keys
+        if store and sku
+    ]
+
+    if not pairs:
+        return []
+
+    query = {
+        "$or": [
+            {
+                "retailer": store,
+                "sku": sku,
+            }
+            for store, sku in pairs
+        ]
+    }
+
+    projection = {
+        "title": 1,
+        "brand": 1,
+        "model": 1,
+        "ean": 1,
+        "reference_id": 1,
+        "comparison_key": 1,
+        "sku": 1,
+        "retailer": 1,
+        "url": 1,
+        "image_url": 1,
+        "offer_price": 1,
+        "regular_price": 1,
+        "last_updated": 1,
+    }
+
+    return list(
+        products_col.find(
+            query,
+            projection,
+        )
+    )
+
+
+def save_comparison_set(
+    name,
+    anchor,
+    members,
+):
+    now = pd.Timestamp.utcnow().to_pydatetime()
+
+    anchor_ref = {
+        "retailer": normalize_store(
+            anchor.get("retailer")
+        ),
+        "sku": str(anchor.get("sku")),
+    }
+
+    clean_members = []
+
+    seen = set()
+
+    for member in members:
+        retailer = normalize_store(
+            member.get("retailer")
+        )
+        sku = str(member.get("sku") or "")
+
+        if not retailer or not sku:
+            continue
+
+        key = (retailer, sku)
+
+        if key in seen:
+            continue
+
+        seen.add(key)
+
+        clean_members.append(
+            {
+                "retailer": retailer,
+                "sku": sku,
+                "title": member.get("title", ""),
+                "model": member.get("model", ""),
+                "ean": member.get("ean", ""),
+                "url": member.get("url", ""),
+            }
+        )
+
+    comparison_sets_col.update_one(
+        {
+            "anchor.retailer": (
+                anchor_ref["retailer"]
+            ),
+            "anchor.sku": anchor_ref["sku"],
+        },
+        {
+            "$set": {
+                "name": name.strip(),
+                "anchor": anchor_ref,
+                "members": clean_members,
+                "active": True,
+                "updated_at": now,
+            },
+            "$setOnInsert": {
+                "created_at": now,
+            },
+        },
+        upsert=True,
+    )
+
+    load_comparison_sets.clear()
+    load_products_by_keys.clear()
+
+
+def deactivate_comparison_set(doc_id):
+    comparison_sets_col.update_one(
+        {"_id": doc_id},
+        {
+            "$set": {
+                "active": False,
+                "updated_at": (
+                    pd.Timestamp.utcnow()
+                    .to_pydatetime()
+                ),
+            }
+        },
+    )
+
+    load_comparison_sets.clear()
+
+
+def candidate_label(prod):
+    if prod is None:
+        return "— No fijar producto en esta tienda —"
+
+    title = str(
+        prod.get("title")
+        or "Producto"
+    )
+
+    model = str(
+        prod.get("model")
+        or ""
+    ).strip()
+
+    price = safe_float(
+        prod.get("offer_price")
+    )
+
+    score = safe_float(
+        prod.get("_match_score")
+    )
+
+    label = title[:78]
+
+    if model:
+        label += f" · {model}"
+
+    if price > 0:
+        label += f" · {money(price)}"
+
+    if score > 0:
+        label += f" · match {score:.0f}"
+
+    return label
+
+
+def build_comparison_history(items):
+    rows = []
+
+    for item in items:
+        prod = item["product"]
+        label = store_meta(
+            prod.get("retailer")
+        )["label"]
+
+        model = str(
+            prod.get("model")
+            or ""
+        ).strip()
+
+        for row in item["history"]:
+            price = safe_float(
+                row.get("offer_price")
+            )
+
+            if price <= 0:
+                continue
+
+            rows.append(
+                {
+                    "Fecha": row.get("date"),
+                    "Precio": price,
+                    "Tienda": label,
+                    "SKU": str(
+                        prod.get("sku")
+                    ),
+                    "Modelo": model,
+                }
+            )
+
+    df = pd.DataFrame(rows)
+
+    if not df.empty:
+        df["Fecha"] = pd.to_datetime(
+            df["Fecha"],
+            errors="coerce",
+        )
+        df = (
+            df.dropna(subset=["Fecha"])
+            .sort_values("Fecha")
+        )
+
+    return df
 
 
 def history_for(prod, history_map):
@@ -530,11 +1053,15 @@ def product_metrics(prod, history):
     else:
         proximity = 0.0
 
-    # 50 puntos por descuento y 50 por cercanía al mínimo histórico.
-    score = min(
-        100,
-        min(discount_pct, 50) + (proximity * 50),
-    )
+    # No tratamos una sola captura como evidencia histórica.
+    if len(historical_prices) <= 1:
+        score = min(50, discount_pct)
+    else:
+        # 50 puntos por descuento y 50 por cercanía al mínimo histórico.
+        score = min(
+            100,
+            min(discount_pct, 50) + (proximity * 50),
+        )
 
     if (
         historical_max > historical_min
@@ -548,7 +1075,10 @@ def product_metrics(prod, history):
     else:
         position = 0.0
 
-    if (
+    if len(historical_prices) <= 1:
+        status = ("Historial inicial", "neutral")
+
+    elif (
         len(historical_prices) >= 2
         and current <= historical_min * 1.01
     ):
@@ -985,12 +1515,14 @@ st.write("")
     tab_overview,
     tab_offers,
     tab_compare,
+    tab_watch,
     tab_monitor,
 ) = st.tabs(
     [
         "Resumen",
         "Ofertas",
         "Comparar",
+        "Seguimientos",
         "Monitoreo",
     ]
 )
@@ -1457,6 +1989,716 @@ with tab_compare:
 
 
 # =========================================================
+# TAB: FIXED COMPARISON / WATCHLIST
+# =========================================================
+with tab_watch:
+    render_html(
+        '<div class="section-title">'
+        'Seguimientos fijos entre tiendas'
+        '</div>'
+    )
+
+    render_html(
+        '<div class="section-copy">'
+        'Fija un producto de Siman como referencia, '
+        'confirma su equivalente en otras tiendas y '
+        'ComparaBlack conserva el grupo para saber '
+        'quién tiene el mejor precio a través del tiempo.'
+        '</div>'
+    )
+
+    create_expander = st.expander(
+        "＋ Crear o actualizar seguimiento",
+        expanded=(
+            len(load_comparison_sets()) == 0
+        ),
+    )
+
+    with create_expander:
+        anchor_search = st.text_input(
+            "Buscar producto base en Siman",
+            placeholder=(
+                "Ej. UN55U8000HPX, Samsung 55, "
+                "RMS510..."
+            ),
+            key="watch_anchor_search",
+        )
+
+        siman_results = load_products(
+            search_text=anchor_search,
+            stores=("siman",),
+            limit=80,
+        )
+
+        if not siman_results:
+            st.info(
+                "No encontramos productos de "
+                "Siman con ese término."
+            )
+
+        else:
+            anchor_idx = st.selectbox(
+                "Producto principal de Siman",
+                range(len(siman_results)),
+                format_func=lambda i: (
+                    product_label(
+                        siman_results[i]
+                    )
+                ),
+                key="watch_anchor_product",
+            )
+
+            anchor = siman_results[
+                anchor_idx
+            ]
+
+            anchor_title = str(
+                anchor.get("title")
+                or ""
+            )
+            anchor_model = str(
+                anchor.get("model")
+                or ""
+            )
+            anchor_brand = str(
+                anchor.get("brand")
+                or ""
+            )
+            anchor_ean = str(
+                anchor.get("ean")
+                or ""
+            )
+            anchor_comp_key = str(
+                anchor.get("comparison_key")
+                or ""
+            )
+
+            a1, a2, a3 = st.columns(3)
+
+            a1.metric(
+                "Tienda base",
+                "Siman",
+            )
+
+            a2.metric(
+                "Modelo detectado",
+                anchor_model or "Sin modelo",
+            )
+
+            a3.metric(
+                "EAN",
+                anchor_ean or "No disponible",
+            )
+
+            st.caption(
+                "El sistema propone coincidencias "
+                "por EAN, modelo y similitud de "
+                "nombre. Confirma manualmente que "
+                "sea exactamente la misma variante."
+            )
+
+            selected_members = [anchor]
+
+            other_stores = [
+                store
+                for store in STORES
+                if store != "siman"
+            ]
+
+            for store in other_stores:
+                label = STORES[store][
+                    "label"
+                ]
+
+                default_query = (
+                    anchor_model
+                    or (
+                        f"{anchor_brand} "
+                        + " ".join(
+                            significant_tokens(
+                                anchor_title
+                            )[:2]
+                        )
+                    ).strip()
+                )
+
+                with st.container(
+                    border=True
+                ):
+                    st.markdown(
+                        f"**{label}**"
+                    )
+
+                    q = st.text_input(
+                        f"Buscar en {label}",
+                        value=default_query,
+                        key=(
+                            f"watch_search_"
+                            f"{store}"
+                        ),
+                        label_visibility=(
+                            "collapsed"
+                        ),
+                    )
+
+                    auto_candidates = (
+                        find_match_candidates(
+                            store=store,
+                            anchor_title=(
+                                anchor_title
+                            ),
+                            anchor_brand=(
+                                anchor_brand
+                            ),
+                            anchor_model=(
+                                anchor_model
+                            ),
+                            anchor_ean=(
+                                anchor_ean
+                            ),
+                            anchor_comparison_key=(
+                                anchor_comp_key
+                            ),
+                            limit=20,
+                        )
+                    )
+
+                    manual_candidates = (
+                        load_products(
+                            search_text=q,
+                            stores=(store,),
+                            limit=40,
+                        )
+                        if q.strip()
+                        else []
+                    )
+
+                    merged = []
+                    seen_candidate_keys = set()
+
+                    for candidate in (
+                        auto_candidates
+                        + manual_candidates
+                    ):
+                        candidate_key = (
+                            normalize_store(
+                                candidate.get(
+                                    "retailer"
+                                )
+                            ),
+                            str(
+                                candidate.get(
+                                    "sku"
+                                )
+                            ),
+                        )
+
+                        if (
+                            candidate_key
+                            in seen_candidate_keys
+                        ):
+                            continue
+
+                        seen_candidate_keys.add(
+                            candidate_key
+                        )
+
+                        if (
+                            "_match_score"
+                            not in candidate
+                        ):
+                            candidate[
+                                "_match_score"
+                            ] = match_score(
+                                anchor,
+                                candidate,
+                            )
+
+                        merged.append(
+                            candidate
+                        )
+
+                    merged.sort(
+                        key=lambda item: (
+                            item.get(
+                                "_match_score",
+                                0,
+                            )
+                        ),
+                        reverse=True,
+                    )
+
+                    options = [None] + merged[
+                        :30
+                    ]
+
+                    selected = st.selectbox(
+                        f"Equivalente en {label}",
+                        options=options,
+                        index=(
+                            1
+                            if len(options) > 1
+                            else 0
+                        ),
+                        format_func=(
+                            candidate_label
+                        ),
+                        key=(
+                            f"watch_candidate_"
+                            f"{store}"
+                        ),
+                    )
+
+                    if selected:
+                        selected_members.append(
+                            selected
+                        )
+
+                        match_value = (
+                            selected.get(
+                                "_match_score",
+                                0,
+                            )
+                        )
+
+                        if match_value >= 550:
+                            st.success(
+                                "Coincidencia fuerte "
+                                "(modelo/EAN)."
+                            )
+                        elif match_value >= 220:
+                            st.info(
+                                "Coincidencia probable. "
+                                "Verifica el modelo."
+                            )
+                        else:
+                            st.warning(
+                                "Coincidencia débil. "
+                                "Confírmala manualmente."
+                            )
+
+            default_name = (
+                f"{anchor_brand} "
+                f"{anchor_model}"
+            ).strip()
+
+            if not default_name:
+                default_name = (
+                    anchor_title[:55]
+                )
+
+            tracking_name = st.text_input(
+                "Nombre del seguimiento",
+                value=default_name,
+                key="watch_name",
+            )
+
+            if st.button(
+                "Guardar seguimiento",
+                type="primary",
+                use_container_width=True,
+                key="save_watch",
+            ):
+                save_comparison_set(
+                    name=(
+                        tracking_name
+                        or default_name
+                        or "Comparación"
+                    ),
+                    anchor=anchor,
+                    members=(
+                        selected_members
+                    ),
+                )
+
+                st.success(
+                    "Seguimiento guardado en "
+                    "MongoDB. Se conservará para "
+                    "las próximas capturas."
+                )
+
+                st.rerun()
+
+    st.write("")
+
+    comparison_sets = (
+        load_comparison_sets()
+    )
+
+    if not comparison_sets:
+        st.info(
+            "Todavía no hay seguimientos "
+            "guardados."
+        )
+
+    else:
+        selected_set_index = st.selectbox(
+            "Seguimiento guardado",
+            range(
+                len(comparison_sets)
+            ),
+            format_func=lambda i: (
+                comparison_sets[i].get(
+                    "name",
+                    "Comparación",
+                )
+            ),
+            key="saved_watch_selector",
+        )
+
+        selected_set = (
+            comparison_sets[
+                selected_set_index
+            ]
+        )
+
+        members = (
+            selected_set.get(
+                "members",
+                [],
+            )
+        )
+
+        member_keys = tuple(
+            (
+                normalize_store(
+                    member.get(
+                        "retailer"
+                    )
+                ),
+                str(
+                    member.get("sku")
+                    or ""
+                ),
+            )
+            for member in members
+        )
+
+        fixed_products = (
+            load_products_by_keys(
+                member_keys
+            )
+        )
+
+        fixed_history = load_history(
+            member_keys
+        )
+
+        fixed_items = enrich_products(
+            fixed_products,
+            fixed_history,
+        )
+
+        fixed_items = [
+            item
+            for item in fixed_items
+            if item["current"] > 0
+        ]
+
+        if not fixed_items:
+            st.warning(
+                "El seguimiento existe, pero "
+                "todavía no hay precios "
+                "disponibles para sus miembros."
+            )
+
+        else:
+            current_sorted = sorted(
+                fixed_items,
+                key=lambda item: (
+                    item["current"]
+                ),
+            )
+
+            winner = current_sorted[0]
+
+            anchor_item = next(
+                (
+                    item
+                    for item in fixed_items
+                    if normalize_store(
+                        item["product"].get(
+                            "retailer"
+                        )
+                    )
+                    == "siman"
+                ),
+                None,
+            )
+
+            winner_store = store_meta(
+                winner["product"].get(
+                    "retailer"
+                )
+            )["label"]
+
+            anchor_price = (
+                anchor_item["current"]
+                if anchor_item
+                else 0
+            )
+
+            saving_vs_anchor = (
+                max(
+                    0,
+                    anchor_price
+                    - winner["current"],
+                )
+                if anchor_price > 0
+                else 0
+            )
+
+            w1, w2, w3, w4 = st.columns(4)
+
+            w1.metric(
+                "Mejor precio hoy",
+                money(
+                    winner["current"]
+                ),
+            )
+
+            w2.metric(
+                "Tienda líder",
+                winner_store,
+            )
+
+            w3.metric(
+                "Precio Siman",
+                (
+                    money(anchor_price)
+                    if anchor_price > 0
+                    else "N/D"
+                ),
+            )
+
+            w4.metric(
+                "Ahorro vs. Siman",
+                money(
+                    saving_vs_anchor
+                ),
+            )
+
+            table_rows = []
+
+            for item in current_sorted:
+                prod = item["product"]
+
+                delta = (
+                    item["current"]
+                    - winner["current"]
+                )
+
+                table_rows.append(
+                    {
+                        "Tienda": (
+                            store_meta(
+                                prod.get(
+                                    "retailer"
+                                )
+                            )["label"]
+                        ),
+                        "Producto": (
+                            prod.get("title")
+                            or ""
+                        ),
+                        "Modelo": (
+                            prod.get("model")
+                            or ""
+                        ),
+                        "Precio actual": (
+                            item["current"]
+                        ),
+                        "Diferencia vs líder": (
+                            delta
+                        ),
+                        "Mínimo histórico": (
+                            item[
+                                "historical_min"
+                            ]
+                        ),
+                        "Capturas": (
+                            item["captures"]
+                        ),
+                        "Ganador hoy": (
+                            "✓"
+                            if item is winner
+                            else ""
+                        ),
+                    }
+                )
+
+            st.dataframe(
+                pd.DataFrame(
+                    table_rows
+                ),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Precio actual": (
+                        st.column_config
+                        .NumberColumn(
+                            format="$%.2f"
+                        )
+                    ),
+                    "Diferencia vs líder": (
+                        st.column_config
+                        .NumberColumn(
+                            format="$%.2f"
+                        )
+                    ),
+                    "Mínimo histórico": (
+                        st.column_config
+                        .NumberColumn(
+                            format="$%.2f"
+                        )
+                    ),
+                },
+            )
+
+            comparison_history_df = (
+                build_comparison_history(
+                    fixed_items
+                )
+            )
+
+            if (
+                not comparison_history_df
+                .empty
+            ):
+                fig = px.line(
+                    comparison_history_df,
+                    x="Fecha",
+                    y="Precio",
+                    color="Tienda",
+                    markers=True,
+                    hover_data=[
+                        "Modelo",
+                        "SKU",
+                    ],
+                )
+
+                fig.update_layout(
+                    height=470,
+                    margin=dict(
+                        l=10,
+                        r=10,
+                        t=20,
+                        b=10,
+                    ),
+                    paper_bgcolor=(
+                        "rgba(0,0,0,0)"
+                    ),
+                    plot_bgcolor=(
+                        "rgba(0,0,0,0)"
+                    ),
+                    xaxis_title="",
+                    yaxis_title=(
+                        "Precio (USD)"
+                    ),
+                    hovermode="x unified",
+                    legend=dict(
+                        orientation="h",
+                        y=1.08,
+                        x=0,
+                    ),
+                )
+
+                st.plotly_chart(
+                    fig,
+                    use_container_width=True,
+                )
+
+                # Quién fue el más barato cada día.
+                daily_leaders = (
+                    comparison_history_df
+                    .sort_values(
+                        [
+                            "Fecha",
+                            "Precio",
+                        ]
+                    )
+                    .groupby(
+                        "Fecha",
+                        as_index=False,
+                    )
+                    .first()
+                )
+
+                leader_counts = (
+                    daily_leaders[
+                        "Tienda"
+                    ]
+                    .value_counts()
+                    .rename_axis(
+                        "Tienda"
+                    )
+                    .reset_index(
+                        name="Días líder"
+                    )
+                )
+
+                if not leader_counts.empty:
+                    st.markdown(
+                        "**Quién ha ganado "
+                        "más días**"
+                    )
+
+                    st.dataframe(
+                        leader_counts,
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+            d1, d2 = st.columns(
+                [1, 3]
+            )
+
+            with d1:
+                confirm_delete = (
+                    st.checkbox(
+                        "Confirmar eliminación",
+                        key=(
+                            "confirm_delete_"
+                            + str(
+                                selected_set[
+                                    "_id"
+                                ]
+                            )
+                        ),
+                    )
+                )
+
+                if st.button(
+                    "Eliminar seguimiento",
+                    disabled=(
+                        not confirm_delete
+                    ),
+                    key=(
+                        "delete_watch_"
+                        + str(
+                            selected_set[
+                                "_id"
+                            ]
+                        )
+                    ),
+                ):
+                    deactivate_comparison_set(
+                        selected_set["_id"]
+                    )
+
+                    st.rerun()
+
+            with d2:
+                st.caption(
+                    "Los productos quedan fijos "
+                    "por tienda + SKU. El tracker "
+                    "solo actualiza sus precios; "
+                    "no cambia automáticamente el "
+                    "producto que elegiste."
+                )
+
+
+# =========================================================
 # TAB: MONITOR
 # =========================================================
 with tab_monitor:
@@ -1637,8 +2879,8 @@ with tab_monitor:
 st.divider()
 
 st.caption(
-    "ComparaBlack SV · Los indicadores se basan "
+    "ComparaBlack SV · Los indicadores y seguimientos se basan "
     "en tu propio historial de capturas. Mientras "
-    "más días de seguimiento acumules, más confiable "
-    "será la auditoría."
+    "más días acumules, más confiable será la auditoría "
+    "y la comparación entre almacenes."
 )
