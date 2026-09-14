@@ -32,7 +32,7 @@ def get_database():
     return client["black_friday_sv"]
 
 if not MONGO_URI:
-    st.error("⚠️ MONGO_URI no configurada.")
+    st.error("⚠️ MONGO_URI no configurada en los Secrets de Streamlit.")
     st.stop()
 
 db = get_database()
@@ -43,14 +43,14 @@ history_col = db["price_history"]
 st.title("🛒 ComparaBlack SV")
 st.caption("Rastreador y auditor histórico de precios para evitar ofertas falsas en Black Friday (El Salvador)")
 
-# Barra superior: Búsqueda y Filtros
-col_search, col_cat = st.columns()
+# Barra superior: Búsqueda y Filtros (2 columnas)
+col_search, col_cat = st.columns(2)
 with col_search:
     search_query = st.text_input("🔍 Buscar producto o modelo (ej. Samsung 55, Mabe, Inverter, LG OLED):", "")
 with col_cat:
     selected_retailer = st.selectbox("Filtrar por tienda:", ["Todas", "siman", "lacuracao", "walmart", "omnisport", "prado"])
 
-# Métricas generales
+# Métricas generales (3 columnas)
 col_m1, col_m2, col_m3 = st.columns(3)
 total_prods = products_col.count_documents({})
 col_m1.metric("📦 Productos Monitoreados", total_prods)
@@ -85,6 +85,7 @@ else:
             regular_price = history[-1].get("regular_price", 0.0)
             prices = [h.get("offer_price", 0.0) for h in history if h.get("offer_price", 0.0) > 0]
             min_price = min(prices) if prices else current_price
+            max_price = max(prices) if prices else current_price
         else:
             current_price = regular_price = min_price = 0.0
 
