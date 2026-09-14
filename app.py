@@ -349,6 +349,8 @@ except Exception as exc:
 products_col = db["products"]
 history_col = db["price_history"]
 comparison_sets_col = db["comparison_sets"]
+tracker_logs_col = db["tracker_logs"]
+tracker_runs_col = db["tracker_runs"]
 
 
 # =========================================================
@@ -475,6 +477,97 @@ def load_global_metrics():
     total = products_col.count_documents({})
     stores = len(products_col.distinct("retailer"))
     return total, stores
+
+
+# =========================================================
+# TRACKER STATUS / LOG HELPERS
+# =========================================================
+@st.cache_data(ttl=15, show_spinner=False)
+def load_tracker_runs(limit=20):
+    try:
+        return list(
+            tracker_runs_col.find(
+                {},
+                {"_id": 0},
+            )
+            .sort("started_at", -1)
+            .limit(limit)
+        )
+    except Exception:
+        return []
+
+
+@st.cache_data(ttl=15, show_spinner=False)
+def load_tracker_logs(
+    retailer="",
+    level="",
+    limit=300,
+):
+    query = {}
+
+    if retailer:
+        query["retailer"] = retailer
+
+    if level:
+        query["level"] = level
+
+    projection = {
+        "_id": 0,
+        "timestamp": 1,
+        "run_id": 1,
+        "retailer": 1,
+        "level": 1,
+        "event": 1,
+        "message": 1,
+        "status_code": 1,
+        "context": 1,
+        "url": 1,
+        "retry_count": 1,
+    }
+
+    try:
+        return list(
+            tracker_logs_col.find(
+                query,
+                projection,
+            )
+            .sort("timestamp", -1)
+            .limit(limit)
+        )
+    except Exception:
+        return []
+
+
+def format_tracker_datetime(value):
+    if not value:
+        return "N/D"
+
+    try:
+        ts = pd.to_datetime(
+            value,
+            utc=True,
+        )
+
+        return ts.strftime(
+            "%d/%m/%Y %H:%M UTC"
+        )
+    except Exception:
+        return str(value)
+
+
+def tracker_status_label(status):
+    mapping = {
+        "completed": "Completado",
+        "partial": "Parcial",
+        "running": "Ejecutándose",
+        "skipped": "Omitido",
+        "failed": "Falló",
+    }
+
+    return mapping.get(
+        str(status or "").lower(),
+        str(status or "Sin datos").title(),
+    )
 
 
 # =========================================================
@@ -1516,6 +1609,7 @@ st.write("")
     tab_offers,
     tab_compare,
     tab_watch,
+    tab_tracker,
     tab_monitor,
 ) = st.tabs(
     [
@@ -1523,6 +1617,7 @@ st.write("")
         "Ofertas",
         "Comparar",
         "Seguimientos",
+        "Estado tracker",
         "Monitoreo",
     ]
 )
@@ -2696,6 +2791,444 @@ with tab_watch:
                     "no cambia automáticamente el "
                     "producto que elegiste."
                 )
+
+
+# =========================================================
+# TAB: TRACKER STATUS / LOGS
+# =========================================================
+with tab_tracker:
+    render_html(
+        '<div class="section-title">'
+        'Estado del tracker'
+        '</div>'
+    )
+
+    render_html(
+        '<div class="section-copy">'
+        'Supervisa cada ejecución del rastreador, '
+        'los comercios omitidos, rate limits, '
+        'errores de conexión y otros fallos.'
+        '</div>'
+    )
+
+    refresh_col, spacer_col = st.columns(
+        [.24, .76]
+    )
+
+    with refresh_col:
+        if st.button(
+            "Actualizar estado",
+            use_container_width=True,
+            key="refresh_tracker_status",
+        ):
+            load_tracker_runs.clear()
+            load_tracker_logs.clear()
+            st.rerun()
+
+    runs = load_tracker_runs(
+        limit=20
+    )
+
+    if not runs:
+        st.info(
+            "Todavía no existen ejecuciones "
+            "registradas en `tracker_runs`. "
+            "Ejecuta el nuevo tracker.py al menos una vez."
+        )
+
+    else:
+        latest = runs[0]
+
+        stores_info = (
+            latest.get("stores")
+            or {}
+        )
+
+        retry_total = sum(
+            int(
+                (info or {}).get(
+                    "retry_events",
+                    0,
+                )
+                or 0
+            )
+            for info in stores_info.values()
+        )
+
+        skipped_stores = (
+            latest.get(
+                "skipped_stores",
+                [],
+            )
+            or []
+        )
+
+        failed_stores = (
+            latest.get(
+                "failed_stores",
+                [],
+            )
+            or []
+        )
+
+        r1, r2, r3, r4 = st.columns(4)
+
+        r1.metric(
+            "Última ejecución",
+            tracker_status_label(
+                latest.get("status")
+            ),
+        )
+
+        r2.metric(
+            "Inicio",
+            format_tracker_datetime(
+                latest.get(
+                    "started_at"
+                )
+            ),
+        )
+
+        r3.metric(
+            "Reintentos",
+            retry_total,
+        )
+
+        r4.metric(
+            "Tiendas omitidas",
+            len(
+                set(
+                    skipped_stores
+                    + failed_stores
+                )
+            ),
+        )
+
+        run_id = latest.get(
+            "run_id",
+            "N/D",
+        )
+
+        st.caption(
+            f"Run ID: {run_id} · "
+            f"Finalización: "
+            f"{format_tracker_datetime(latest.get('finished_at'))}"
+        )
+
+        store_rows = []
+
+        known_stores = list(
+            dict.fromkeys(
+                list(STORES.keys())
+                + list(
+                    stores_info.keys()
+                )
+            )
+        )
+
+        for store in known_stores:
+            info = (
+                stores_info.get(store)
+                or {}
+            )
+
+            store_rows.append(
+                {
+                    "Comercio": (
+                        store_meta(
+                            store
+                        )["label"]
+                    ),
+                    "Estado": (
+                        tracker_status_label(
+                            info.get(
+                                "status"
+                            )
+                        )
+                    ),
+                    "Productos/SKU": int(
+                        info.get(
+                            "products",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "Reintentos": int(
+                        info.get(
+                            "retry_events",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "Requests fallidos": int(
+                        info.get(
+                            "failed_requests",
+                            0,
+                        )
+                        or 0
+                    ),
+                    "Motivo": (
+                        info.get(
+                            "reason"
+                        )
+                        or ""
+                    ),
+                }
+            )
+
+        st.markdown(
+            "**Estado por comercio**"
+        )
+
+        st.dataframe(
+            pd.DataFrame(
+                store_rows
+            ),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if skipped_stores:
+            st.warning(
+                "Omitidos automáticamente en "
+                "esta ejecución: "
+                + ", ".join(
+                    store_meta(
+                        store
+                    )["label"]
+                    for store
+                    in skipped_stores
+                )
+                + ". El tracker continuó con "
+                "los demás comercios."
+            )
+
+    st.write("")
+
+    render_html(
+        '<div class="section-title">'
+        'Log de errores y eventos'
+        '</div>'
+    )
+
+    l1, l2, l3 = st.columns(
+        [1.2, 1, .8]
+    )
+
+    retailer_filter_label = (
+        l1.selectbox(
+            "Comercio",
+            [
+                "Todos",
+                "siman",
+                "walmart",
+                "lacuracao",
+                "prado",
+                "omnisport",
+                "system",
+            ],
+            format_func=lambda value: (
+                "Todos"
+                if value == "Todos"
+                else (
+                    "Sistema"
+                    if value == "system"
+                    else store_meta(
+                        value
+                    )["label"]
+                )
+            ),
+            key="tracker_log_retailer",
+        )
+    )
+
+    level_filter_label = (
+        l2.selectbox(
+            "Nivel",
+            [
+                "Todos",
+                "ERROR",
+                "WARNING",
+                "INFO",
+            ],
+            key="tracker_log_level",
+        )
+    )
+
+    log_limit = l3.selectbox(
+        "Eventos",
+        [50, 100, 250, 500],
+        index=2,
+        key="tracker_log_limit",
+    )
+
+    retailer_filter = (
+        ""
+        if retailer_filter_label
+        == "Todos"
+        else retailer_filter_label
+    )
+
+    level_filter = (
+        ""
+        if level_filter_label
+        == "Todos"
+        else level_filter_label
+    )
+
+    logs = load_tracker_logs(
+        retailer=retailer_filter,
+        level=level_filter,
+        limit=log_limit,
+    )
+
+    if not logs:
+        st.info(
+            "No hay eventos para "
+            "los filtros seleccionados."
+        )
+
+    else:
+        log_df = pd.DataFrame(
+            logs
+        )
+
+        if (
+            "timestamp"
+            in log_df.columns
+        ):
+            log_df["timestamp"] = (
+                pd.to_datetime(
+                    log_df[
+                        "timestamp"
+                    ],
+                    utc=True,
+                    errors="coerce",
+                )
+            )
+
+        # Resumen rápido de problemas.
+        errors_count = int(
+            (
+                log_df.get(
+                    "level",
+                    pd.Series(
+                        dtype=str
+                    ),
+                )
+                == "ERROR"
+            ).sum()
+        )
+
+        warnings_count = int(
+            (
+                log_df.get(
+                    "level",
+                    pd.Series(
+                        dtype=str
+                    ),
+                )
+                == "WARNING"
+            ).sum()
+        )
+
+        rate_limits = int(
+            (
+                pd.to_numeric(
+                    log_df.get(
+                        "status_code",
+                        pd.Series(
+                            dtype=float
+                        ),
+                    ),
+                    errors="coerce",
+                )
+                == 429
+            ).sum()
+        )
+
+        e1, e2, e3 = st.columns(3)
+
+        e1.metric(
+            "Errores en vista",
+            errors_count,
+        )
+
+        e2.metric(
+            "Advertencias",
+            warnings_count,
+        )
+
+        e3.metric(
+            "Rate limits 429",
+            rate_limits,
+        )
+
+        visible_columns = [
+            column
+            for column in [
+                "timestamp",
+                "retailer",
+                "level",
+                "event",
+                "status_code",
+                "retry_count",
+                "context",
+                "message",
+                "run_id",
+            ]
+            if column
+            in log_df.columns
+        ]
+
+        display_df = (
+            log_df[
+                visible_columns
+            ]
+            .copy()
+        )
+
+        display_df = (
+            display_df.rename(
+                columns={
+                    "timestamp": "Fecha",
+                    "retailer": "Comercio",
+                    "level": "Nivel",
+                    "event": "Evento",
+                    "status_code": "HTTP",
+                    "retry_count": "Reintento",
+                    "context": "Contexto",
+                    "message": "Mensaje",
+                    "run_id": "Run ID",
+                }
+            )
+        )
+
+        st.dataframe(
+            display_df,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Fecha": (
+                    st.column_config
+                    .DatetimeColumn(
+                        format=(
+                            "DD/MM/YYYY "
+                            "HH:mm:ss"
+                        )
+                    )
+                )
+            },
+        )
+
+        st.caption(
+            "Los HTTP 429 indican rate limiting. "
+            "Al llegar al límite configurado de "
+            "reintentos consecutivos, el tracker "
+            "abre el circuit breaker, registra "
+            "`SITE_SKIPPED` y continúa con la "
+            "siguiente tienda."
+        )
 
 
 # =========================================================
